@@ -1,0 +1,198 @@
+#include "stdlib.fc";
+
+int state::uninitialized() asm "0 PUSHINT";
+int state::active() asm "1 PUSHINT";
+int state::completed() asm "2 PUSHINT";
+int state::cancelled() asm "3 PUSHINT";
+
+int op::complete() asm "1 PUSHINT";
+int op::cancel() asm "2 PUSHINT";
+
+int error::not_active() asm "101 PUSHINT";
+int error::invalid_op() asm "102 PUSHINT";
+int error::not_expired() asm "103 PUSHINT";
+int error::invalid_signature() asm "104 PUSHINT";
+int error::wrong_target() asm "105 PUSHINT";
+int error::not_enough_coins() asm "106 PUSHINT";
+
+int out_op::seller_completion() asm "0x4e8eec8f PUSHINT";
+int out_op::fee_gainer_completion() asm "0x11397f78 PUSHINT";
+int out_op::cancellation() asm "0x72551da1 PUSHINT";
+
+int excess_coins_amount() asm "50000000 PUSHINT"; ;; 0.05 TON
+
+global int deal_id;
+global int state;
+global slice buyer_address;
+global slice seller_address;
+global int expires_at;
+
+global int guarantor_public_key;
+global slice fee_gainer_address;
+
+global int fee_amount;
+global int coins_amount;
+
+() load_data() impure {
+    slice data = get_data().begin_parse();
+
+    deal_id = data~load_uint(64);
+    state = data~load_uint(2);
+    buyer_address = data~load_msg_addr();
+    seller_address = data~load_msg_addr();
+    expires_at = data~load_uint(64);
+
+    slice admins = data~load_ref().begin_parse();
+
+    guarantor_public_key = admins~load_uint(256);
+    fee_gainer_address = admins~load_msg_addr();
+
+    slice amounts = data~load_ref().begin_parse();
+
+    fee_amount = amounts~load_coins();
+    coins_amount = amounts~load_coins();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+            .store_uint(deal_id, 64)
+            .store_uint(state, 2)
+            .store_slice(buyer_address)
+            .store_slice(seller_address)
+            .store_uint(expires_at, 64)
+            .store_ref(begin_cell()
+                        .store_uint(guarantor_public_key, 256)
+                        .store_slice(fee_gainer_address)
+                        .end_cell())
+            .store_ref(begin_cell()
+                        .store_coins(fee_amount)
+                        .store_coins(coins_amount)
+                        .end_cell())
+            .end_cell());
+}
+
+() send_coins(slice to, int amount, int op, int query, int mode) impure {
+    send_raw_message(begin_cell()
+                    .store_uint(0x10, 6) ;; no bounce
+                    .store_slice(to)
+                    .store_coins(amount)
+                    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                    .store_uint(op, 32)
+                    .store_uint(query, 64)
+                    .end_cell(), mode);
+}
+
+() cancel(int query) impure {
+    state = state::cancelled();
+    save_data();
+
+    send_coins(buyer_address, fee_amount + coins_amount, out_op::cancellation(), query, 1);
+}
+
+() complete(int query) impure {
+    state = state::completed();
+    save_data();
+
+    send_coins(seller_address, coins_amount, out_op::seller_completion(), query, 1);
+
+    if (fee_amount > 0) {
+        send_coins(fee_gainer_address, fee_amount, out_op::fee_gainer_completion(), query, 1);
+    }
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) {  ;; ignore all bounced messages
+        return ();
+    }
+
+    load_data();
+
+    if (state == state::uninitialized()) {
+        if (msg_value >= fee_amount + coins_amount + excess_coins_amount()) {
+            state = state::active();
+            save_data();
+            return ();
+        }
+
+        throw(error::not_enough_coins());
+    }
+
+    if (state != state::active()) {
+        throw(error::not_active());
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    int op = in_msg~load_uint(32);
+    int query = in_msg~load_uint(64);
+    
+    if (equal_slices(sender_address, seller_address)) {
+        if (op == op::cancel()) {
+            cancel(query);
+            return ();
+        }
+        
+        throw(error::invalid_op());
+    }
+
+    if (equal_slices(sender_address, buyer_address)) {
+        if (op == op::cancel()) {
+            if (now() < expires_at) {
+                throw(error::not_expired());
+            }
+
+            cancel(query);
+            return ();
+        }
+
+        throw(error::invalid_op());
+    }
+
+    throw(0xffff);
+}
+
+() recv_external(slice in_msg) impure {
+    slice signature = begin_parse(in_msg~load_ref());
+
+    load_data();
+
+    if (~ check_signature(slice_hash(in_msg), signature, guarantor_public_key)) {
+        throw(error::invalid_signature());
+    }
+
+    int op = in_msg~load_uint(32);
+    int query = in_msg~load_uint(64);
+
+    slice target_addr = in_msg~load_msg_addr();
+
+    if (~ equal_slices(my_address(), target_addr)) {
+        throw(error::wrong_target());
+    }
+
+    accept_message();
+
+    if (state != state::active()) {
+        throw(error::not_active());
+    }
+
+    if (op == op::complete()) {
+        complete(query);
+        return ();
+    }
+
+    if (op == op::cancel()) {
+        cancel(query);
+        return ();
+    }
+
+    throw(error::invalid_op());
+}
+
+(_) get_deal_state() method_id {
+    load_data();
+
+    return (deal_id, state, buyer_address, seller_address, expires_at, guarantor_public_key, fee_gainer_address, fee_amount, coins_amount);
+}
